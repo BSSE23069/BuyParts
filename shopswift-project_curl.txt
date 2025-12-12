@@ -1,0 +1,5 @@
+
+curl https://auth.us-east-2.aws.commercetools.com/oauth/token \
+     --basic --user "jvHH9sAoOn-J-90Ocg9jpzC5:79EWq9aPhj3RV-A5HvOW6fz8q6ze8ZZb" \
+     -X POST \
+     -d "grant_type=client_credentials&scope=manage_project:shopswift-project"
