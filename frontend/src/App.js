@@ -20,6 +20,7 @@ const s3Client = new S3Client({
   }
 });
 
+
 function App() {
   // --- STATE ---
   const [user, setUser] = useState(null);
@@ -47,6 +48,23 @@ function App() {
       city: 'Berlin', 
       zip: '12345'
   });
+// Function to convert all products to USD/US
+const convertAllToUSD = () => {
+  const savedProducts = JSON.parse(localStorage.getItem("products")) || [];
+  const updatedProducts = savedProducts.map((p) => ({
+    ...p,
+    currency: "USD",     // set currency to USD
+    country: "US"        // set country to US
+  }));
+
+  // Save back to localStorage
+  localStorage.setItem("products", JSON.stringify(updatedProducts));
+  setProducts(updatedProducts); // update state if needed
+  alert("All products updated to USD/US!");
+};
+
+// Run this once on admin side or in useEffect
+// convertAllToUSD();
 
   // --- INITIAL LOAD ---
   useEffect(() => {
@@ -150,28 +168,31 @@ function App() {
 
   // --- CHECKOUT SUBMISSION ---
   // --- BULLETPROOF SUBMIT ORDER ---
+  // --- SIMPLIFIED "ONE-CLICK" ORDER ---
+  // --- DYNAMIC ORDER (DETECTS CURRENCY FROM PRODUCT) ---
+  // --- ROBUST SUBMIT ORDER (FORCES US SETTINGS) ---
   const submitOrder = async () => {
     setOrderStatus("Processing...");
-    console.log("🚀 Starting Order Process...");
+    console.log("🚀 Starting Order...");
 
     try {
-        // --- STEP 1: Create Cart ---
-        // We force US country to match your Admin Products
-        const createCartDraft = { currency: "US", country: "" };
-        console.log("1. Creating Cart...", createCartDraft);
+        // --- STEP 1: FORCE US CART ---
+        // We force "US" because your Admin Panel saves prices as "US".
+        // This prevents the "Global vs Country" mismatch error.
+        const createCartDraft = { 
+            currency: "USD", 
+            country: "US" 
+        };
         
         const cartRes = await apiRoot.carts().post({ body: createCartDraft }).execute();
         const cartId = cartRes.body.id;
         let cartVersion = cartRes.body.version;
-        
-        console.log(`✅ Cart Created. ID: ${cartId}, Version: ${cartVersion}`);
 
-        // --- STEP 2: Prepare Actions (Items + Address) ---
-        // We bundle everything into one update to be safer
+        // --- STEP 2: PREPARE ITEMS & ADDRESS ---
         const actions = [];
 
         // A. Add Items
-        cart.map(item => {
+        cart.forEach(item => {
             actions.push({
                 action: "addLineItem",
                 productId: item.id,
@@ -180,66 +201,57 @@ function App() {
             });
         });
 
-        // B. Add Shipping Address (Crucial!)
-        actions.push({
-            action: "setShippingAddress",
-            address: {
-                country: "US", // Keep US to match project settings
-                city: checkoutForm.city || "Berlin",
-                streetName: checkoutForm.street || "Main St",
-                postalCode: checkoutForm.zip || "12345",
-                firstName: user?.firstName || "Guest",
-                lastName: user?.lastName || "User",
-                email: user?.email || "guest@example.com"
-            }
-        });
+        // B. Set Hardcoded US Address (Matches the Cart Country)
+        const orderName = checkoutForm.name || user?.firstName || "Guest";
+        const orderEmail = checkoutForm.email || user?.email || "guest@shopswift.com";
 
-        console.log("2. Sending Actions (Items + Address)...", actions);
+        const addressData = {
+            firstName: orderName.split(" ")[0],
+            lastName: orderName.split(" ")[1] || "User",
+            streetName: "123 Default Street",
+            city: "New York", 
+            postalCode: "10001",
+            region: "NY",
+            country: "US", // MATCHES CART COUNTRY
+            email: orderEmail
+        };
 
-        // --- STEP 3: Update Cart ---
+        actions.push({ action: "setShippingAddress", address: addressData });
+        actions.push({ action: "setBillingAddress", address: addressData });
+
+        // --- STEP 3: UPDATE CART ---
         const updatedCart = await apiRoot.carts().withId({ ID: cartId }).post({
-            body: { 
-                version: cartVersion, 
-                actions: actions 
-            }
+            body: { version: cartVersion, actions: actions }
         }).execute();
         
-        // Update version to the latest one
         cartVersion = updatedCart.body.version;
-        console.log(`✅ Cart Updated. New Version: ${cartVersion}`);
 
-        // --- STEP 4: Create Order ---
-        const orderNumber = "ORD-" + Math.floor(Math.random() * 100000);
-        console.log(`3. Creating Order #${orderNumber}...`);
-
-        // Safety Check: If version is missing, STOP here
-        if (!cartVersion) throw new Error("System Error: Cart Version is missing.");
-
+        // --- STEP 4: PLACE ORDER ---
+        const orderNumber = "ORD-" + Math.floor(Math.random() * 1000000);
         await apiRoot.orders().post({
             body: {
                 id: cartId,
-                version: cartVersion, // This MUST be the latest number
+                version: cartVersion,
                 orderNumber: orderNumber
             }
         }).execute();
 
-        console.log("🎉 Order Success!");
         setOrderStatus("success");
         setCart([]);
-        
-        // Go back to shop after 3 seconds
-        setTimeout(() => { 
-            setOrderStatus(null); 
-            setActiveTab('shop'); 
-        }, 3000);
+        fetchOrders(); // Update Admin list
+        setTimeout(() => { setOrderStatus(null); setActiveTab('shop'); }, 3000);
 
     } catch (err) {
-        console.error("❌ ORDER FAILED:", err);
+        console.error("ORDER ERROR:", err);
         setOrderStatus("error");
-        alert("Order Failed: " + err.message);
+        
+        // Show the REAL error message from Commercetools
+        let msg = err.message;
+        if (err.body && err.body.message) msg = err.body.message;
+        
+        alert("Order Failed: " + msg);
     }
-  };
-
+  }; 
   // --- ADMIN ACTIONS ---
   const handleAddProduct = async (e) => {
     e.preventDefault();
@@ -277,23 +289,51 @@ function App() {
     } catch (err) { alert(err.message); }
   };
 
-  const handleUpdatePrice = async (e, productId) => {
+ // --- UPDATED: HANDLE PRICE CHANGE FOR SPECIFIC VARIANT ---
+  const handleUpdatePrice = async (e, productId, variantId, newPrice) => {
     e.preventDefault();
+    if (!newPrice) return alert("Please enter a price");
+
     try {
+        setOrderStatus("Updating..."); // Show loading status
+        
+        // 1. Get current version
         const pRes = await apiRoot.products().withId({ ID: productId }).get().execute();
         const product = pRes.body;
+        
+        // 2. Update Price for SPECIFIC Variant
         await apiRoot.products().withId({ ID: product.id }).post({
-            body: { version: product.version, actions: [{ action: "setPrices", variantId: product.masterData.current.masterVariant.id, prices: [{ value: { currencyCode: "USD", centAmount: parseFloat(editPrice.price) * 100 }, country: "US" }] }] }
+            body: {
+                version: product.version,
+                actions: [{
+                    action: "setPrices",
+                    variantId: variantId, // <--- TARGETS SPECIFIC VARIANT (1, 2, 3...)
+                    prices: [{ 
+                        value: { 
+                            currencyCode: "USD", 
+                            centAmount: parseFloat(newPrice) * 100 
+                        }, 
+                        country: "US" // Forces US Price to match Checkout
+                    }]
+                }]
+            }
         }).execute();
+
+        // 3. Publish Changes
         const pRes2 = await apiRoot.products().withId({ ID: productId }).get().execute();
         await apiRoot.products().withId({ ID: productId }).post({
             body: { version: pRes2.body.version, actions: [{ action: "publish" }] }
         }).execute();
-        alert("Price Updated!");
-        fetchProducts();
-    } catch(err) { alert(err.message); }
-  };
 
+        alert(`✅ Price updated for Variant ${variantId}!`);
+        setOrderStatus(null);
+        fetchProducts(); // Refresh list
+    } catch(err) { 
+        console.error(err);
+        alert("Update Failed: " + err.message); 
+        setOrderStatus(null);
+    }
+  };
   // --- RENDER VIEWS ---
 
   const renderAuth = (isSignup) => (
@@ -309,22 +349,7 @@ function App() {
     </div>
   );
 
-  const renderCheckout = () => {
-    if (orderStatus === "success") return <div className="success-message"><h2>🎉 Order Placed Successfully!</h2></div>;
-
-    return (
-      <div className="checkout-layout">
-        <div className="checkout-main">
-          <div className="checkout-header">
-            <h2>Confirmation</h2>
-            <div className="steps-indicator">Customer &gt; Items &gt; Shipping &gt; <b>Review</b></div>
-          </div>
-          <div className="section-card">
-             <h3>Review</h3>
-             <table className="review-table">
-                <thead><tr><th>Product</th><th>Price</th><th>Qty</th><th>Subtotal</th></tr></thead>
-                <tbody>
-                    {cart.map(item => (
+   {cart.map(item => (
                         <tr key={item.id}>
                             <td className="product-col">
                                 <div className="prod-name">{getProductName(item)}</div>
@@ -335,74 +360,150 @@ function App() {
                             <td>{formatPrice(getRawPrice(item) * item.quantity)}</td>
                         </tr>
                     ))}
-                </tbody>
-             </table>
-          </div>
-          <div className="section-card">
-              <h3>Shipping Address</h3>
-              <div className="address-grid">
-                  <div className="address-box">
-                      <p>Address: <input value={checkoutForm.street} onChange={e=>setCheckoutForm({...checkoutForm, street:e.target.value})} /></p>
-                      <p>City: <input value={checkoutForm.city} onChange={e=>setCheckoutForm({...checkoutForm, city:e.target.value})} /></p>
-                      <p>Zip: <input value={checkoutForm.zip} onChange={e=>setCheckoutForm({...checkoutForm, zip:e.target.value})} /></p>
-                  </div>
-              </div>
-          </div>
-          <div className="checkout-actions">
-              <button className="cancel-btn" onClick={() => setActiveTab('cart')}>Back</button>
-              <button className="place-order-btn" onClick={submitOrder} disabled={orderStatus === "Processing..."}>
-                 {orderStatus === "Processing..." ? "Processing..." : "Place order"}
-              </button>
-          </div>
-        </div>
+const renderCheckout = () => {
+    if (orderStatus === "success") return <div className="success-message"><h2>🎉 Order Placed Successfully!</h2></div>;
 
-        <div className="checkout-sidebar">
-            <div className="summary-card">
-                <h3>Order summary</h3>
-                <div className="summary-user"><b>For {user?.firstName}</b><div>{user?.email}</div></div>
-                <hr />
-                <div className="summary-row text-green"><span>Tax (19%)</span><span>+ {formatPrice(getTax())}</span></div>
-                <div className="summary-row final-total"><span>Final Total</span><span>{formatPrice(getTotal())}</span></div>
+    return (
+      <div className="checkout-container">
+        <form onSubmit={submitOrder} className="checkout-form">
+            <h2>Finalize Order</h2>
+            <p style={{textAlign:'center', color:'#666'}}>Shipping to: <b>123 Default St, New York, US</b></p>
+            
+            <div className="form-group">
+                <label>Full Name</label>
+                <input 
+                    type="text" 
+                    placeholder="Enter your name" 
+                    value={checkoutForm.name || ""} 
+                    onChange={e => setCheckoutForm({...checkoutForm, name: e.target.value})} 
+                    required 
+                />
             </div>
-        </div>
+
+            <div className="form-group">
+                <label>Email Address</label>
+                <input 
+                    type="email" 
+                    placeholder="Enter your email" 
+                    value={checkoutForm.email || ""} 
+                    onChange={e => setCheckoutForm({...checkoutForm, email: e.target.value})} 
+                    required 
+                />
+            </div>
+
+            <div className="order-summary-box" style={{background:'#f9f9f9', padding:'15px', borderRadius:'8px', marginTop:'20px'}}>
+                <div style={{display:'flex', justifyContent:'space-between', marginBottom:'10px'}}>
+                    <span>Items ({cart.reduce((a,c)=>a+c.quantity,0)})</span>
+                    <span>{formatPrice(getSubtotal())}</span>
+                </div>
+                <div style={{display:'flex', justifyContent:'space-between', marginBottom:'10px', color:'green'}}>
+                    <span>Tax (19%)</span>
+                    <span>+ {formatPrice(getTax())}</span>
+                </div>
+                <div style={{display:'flex', justifyContent:'space-between', fontWeight:'bold', fontSize:'1.2rem', borderTop:'1px solid #ddd', paddingTop:'10px'}}>
+                    <span>Total</span>
+                    <span>{formatPrice(getTotal())}</span>
+                </div>
+            </div>
+
+            <button type="submit" className="submit-order-btn" disabled={orderStatus === "Processing..."}>
+                {orderStatus === "Processing..." ? "Processing..." : "Confirm & Pay"}
+            </button>
+            <button type="button" className="cancel-btn" onClick={() => setActiveTab('cart')}>Cancel</button>
+        </form>
       </div>
     );
   };
 
-  const renderAdmin = () => (
-    <div className="admin-dashboard">
-      <h2>👑 Admin Dashboard</h2>
-      <div className="admin-section">
-        <h3>Add Product</h3>
-        <form onSubmit={handleAddProduct} className="admin-form">
-          <input type="text" placeholder="Name" value={newProduct.name} onChange={e => setNewProduct({...newProduct, name: e.target.value})} />
-          <input type="number" placeholder="Price" value={newProduct.price} onChange={e => setNewProduct({...newProduct, price: e.target.value})} />
-          <div style={{width:'100%', marginTop:'10px'}}>
-             <input type="file" onChange={handleFileSelect} />
-             <p style={{fontSize:'12px'}}>{uploadStatus}</p>
-          </div>
-          <button type="submit">Create</button>
-        </form>
-      </div>
-      <div className="admin-section">
-          <h3>Orders</h3>
-          <div className="admin-list">{orders.map(o => <div key={o.id} className="admin-row">Order #{o.orderNumber}</div>)}</div>
-      </div>
-      <div className="admin-section">
-        <h3>Manage Prices</h3>
-        {products.map(p => (
-            <div key={p.id} className="admin-row">
-                <span>{getProductName(p)}</span>
-                <form onSubmit={(e) => { setEditPrice({...editPrice, productId: p.id}); handleUpdatePrice(e, p.id); }}>
-                    <input type="number" onChange={e => setEditPrice({productId: p.id, price: e.target.value})} style={{width:'60px'}} />
-                    <button type="submit">Save</button>
-                </form>
-            </div>
-        ))}
-      </div>
-    </div>
-  );
+ const renderAdmin = () => {
+    // Helper to combine Master Variant + Other Variants into one list
+    const getAllVariants = (p) => {
+        const master = { ...p.masterData.current.masterVariant, isMaster: true };
+        const others = p.masterData.current.variants || [];
+        return [master, ...others];
+    };
 
+    return (
+      <div className="admin-dashboard">
+        <h2>👑 Admin Dashboard</h2>
+        
+        {/* ADD PRODUCT SECTION (Kept Simple) */}
+        <div className="admin-section">
+          <h3>Add New Product</h3>
+          <form onSubmit={handleAddProduct} className="admin-form">
+            <input type="text" placeholder="Name" value={newProduct.name} onChange={e => setNewProduct({...newProduct, name: e.target.value})} />
+            <input type="number" placeholder="Price" value={newProduct.price} onChange={e => setNewProduct({...newProduct, price: e.target.value})} />
+            <div style={{width:'100%', marginTop:'10px'}}>
+               <input type="file" onChange={handleFileSelect} />
+               <p style={{fontSize:'12px', color:'blue'}}>{uploadStatus}</p>
+            </div>
+            <button type="submit">Create</button>
+          </form>
+        </div>
+
+        {/* ORDER LIST SECTION */}
+        <div className="admin-section">
+            <h3>Recent Orders</h3>
+            <div className="admin-list">
+                {orders.length === 0 ? <p>No orders found.</p> : orders.map(o => (
+                    <div key={o.id} className="admin-row">
+                        <strong>Order #{o.orderNumber}</strong> 
+                        <span>{o.totalPrice ? formatPrice(o.totalPrice.centAmount/100) : "N/A"}</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+
+        {/* NEW: MANAGE ALL VARIANTS PRICES */}
+        <div className="admin-section">
+          <h3>Manage Product Prices (All Variants)</h3>
+          {products.map(p => (
+              <div key={p.id} style={{marginBottom:'20px', border:'1px solid #ddd', padding:'10px', borderRadius:'8px'}}>
+                  <h4 style={{margin:'0 0 10px 0', color:'#4f46e5'}}>{getProductName(p)}</h4>
+                  
+                  {/* LOOP THROUGH EVERY VARIANT */}
+                  {getAllVariants(p).map(variant => {
+                      // Get current price if it exists
+                      const currentPrice = variant.prices && variant.prices.length > 0 
+                        ? variant.prices[0].value.centAmount / 100 
+                        : 0;
+                      
+                      return (
+                        <div key={variant.id} className="admin-row" style={{fontSize:'0.9rem'}}>
+                            <div style={{display:'flex', alignItems:'center', gap:'10px', flex:1}}>
+                                {variant.images && variant.images[0] && <img src={variant.images[0].url} width="30" alt="v" />}
+                                <div>
+                                    <div style={{fontWeight:'bold'}}>Variant ID: {variant.id} {variant.isMaster ? "(Master)" : ""}</div>
+                                    <div style={{color:'#666'}}>SKU: {variant.sku || "No SKU"}</div>
+                                </div>
+                            </div>
+                            
+                            <div style={{marginRight:'15px', fontWeight:'bold', color: currentPrice === 0 ? 'red' : 'green'}}>
+                                {currentPrice === 0 ? "NO PRICE" : formatPrice(currentPrice)}
+                            </div>
+
+                            {/* INDIVIDUAL FORM FOR THIS VARIANT */}
+                            <form 
+                                onSubmit={(e) => {
+                                    // We use e.target[0].value to get the input value without creating 100 state variables
+                                    const val = e.target[0].value;
+                                    handleUpdatePrice(e, p.id, variant.id, val); 
+                                    e.target[0].value = ""; // Clear input after submit
+                                }} 
+                                style={{display:'flex', gap:'5px'}}
+                            >
+                                <input type="number" placeholder="New Price" style={{width:'80px', padding:'5px'}} required />
+                                <button type="submit" style={{padding:'5px 10px', fontSize:'0.8rem'}}>Set</button>
+                            </form>
+                        </div>
+                      );
+                  })}
+              </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
   return (
     <div className="App">
       <nav className="navbar">
